@@ -1,0 +1,778 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>绿建自评工具 | 绿建三星(2024版)交互式数据看板</title>
+    <!-- 引入 Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 引入 Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <!-- Chosen Palette: Calm Harmony (Stone/Slate backgrounds, Emerald accents, Amber/Rose for alerts) -->
+    <!-- Application Structure Plan: 
+         采用“交互式仪表盘 -> 核心行动指引 -> 交互式明细输入表”的结构。
+         调整逻辑：基于用户的需求，深度集成了 Firebase Firestore 云端存储。用户的填写记录将被扁平化并持久化存储在云端特定的用户路径下（`/artifacts/{appId}/users/{userId}/green_building_scores`）。通过监听用户输入进行防抖保存（Debounced Save），并在页面加载完毕完成 Auth 鉴权后自动从云端拉取并回填分数，确保数据跨会话、跨组件状态安全持久。 -->
+    <!-- Visualization & Content Choices: 
+         1. 总体得分 -> 环形图 (Chart.js)
+         2. 板块得分率 -> 雷达图 (Chart.js)
+         3. 详细得分表 -> 交互式Tab数据表 + 细项级输入框 (原生JS)
+         - Confirming NO SVG/Mermaid used. -->
+    <!-- CONFIRMATION: NO SVG graphics used. NO Mermaid JS used. -->
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {
+                            50: '#ecfdf5',
+                            100: '#d1fae5',
+                            500: '#10b981',
+                            600: '#059669',
+                            900: '#064e3b',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { background-color: #f8fafc; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        .chart-container { position: relative; width: 100%; max-width: 100%; margin: 0 auto; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        .tab-btn.active {
+            background-color: #10b981;
+            color: white;
+            font-weight: 600;
+            border-color: #10b981;
+        }
+        .tab-btn.tab-alert.active {
+            background-color: #ef4444; /* rose-500 */
+            color: white;
+            border-color: #ef4444;
+        }
+        
+        /* 隐藏数字输入框的上下箭头 */
+        input[type=number]::-webkit-inner-spin-button, 
+        input[type=number]::-webkit-outer-spin-button { 
+            -webkit-appearance: none; margin: 0; 
+        }
+        input[type=number] { -moz-appearance: textfield; }
+        
+        /* 细项输入框样式 */
+        .sub-score-input {
+            width: 3.5rem;
+            text-align: center;
+            font-weight: 600;
+            color: #064e3b;
+            background-color: #fff;
+            border: 1px solid #a7f3d0;
+            border-radius: 0.25rem;
+            padding: 0.125rem 0.25rem;
+            transition: all 0.2s;
+        }
+        .sub-score-input:focus {
+            outline: none;
+            box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2);
+            border-color: #10b981;
+        }
+        /* 加载动画 */
+        .loader {
+            border: 3px solid #f3f3f3; border-top: 3px solid #10b981; border-radius: 50%; width: 16px; height: 16px; animation: spin 1s linear infinite; display: inline-block; vertical-align: text-bottom;
+        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="text-slate-800 antialiased selection:bg-brand-100 selection:text-brand-900">
+
+    <header class="bg-white shadow-sm border-b border-slate-200 sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+            <div class="flex items-center gap-3">
+                <div class="w-10 h-10 rounded bg-brand-100 text-brand-600 flex items-center justify-center text-xl font-bold">G</div>
+                <div>
+                    <div class="flex items-center gap-2">
+                        <h1 class="text-xl font-bold text-slate-900 leading-tight">绿建自评工具</h1>
+                        <span id="cloudStatus" class="text-xs text-slate-400 bg-slate-50 px-2 py-0.5 rounded border border-slate-100"><span class="loader"></span> 连接云端中...</span>
+                    </div>
+                    <p class="text-xs text-slate-500 mt-0.5">《绿色建筑评价标准》2024修订版 (精细化评估版)</p>
+                </div>
+            </div>
+            <div class="hidden md:flex items-center gap-2">
+                <span class="px-3 py-1 rounded-full bg-slate-100 text-slate-600 text-sm font-medium">目标: 三星级 (≥85分)</span>
+                <span id="headerStatus" class="px-3 py-1 rounded-full bg-slate-100 text-slate-600 text-sm font-medium">状态: 待评估</span>
+            </div>
+        </div>
+    </header>
+
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8" id="mainContent" style="opacity: 0.5; pointer-events: none; transition: opacity 0.3s;">
+
+        <!-- 导语区块 -->
+        <section class="bg-white p-6 rounded-xl shadow-sm border border-slate-100">
+            <h2 class="text-lg font-bold mb-2">交互式精细化评估说明</h2>
+            <p class="text-slate-600 text-sm leading-relaxed">
+                本工具依据 2024 年版局部修订条文编制。为了实现最精准的得分测算，所有包含多个子项的得分点均已<span class="font-bold text-brand-600">拆解为独立输入框</span>。顶部的仪表盘将<span class="font-bold text-brand-600">实时计算您的综合得分</span>。请特别注意带 <span class="bg-rose-100 text-rose-700 px-1 py-0.5 rounded text-xs font-bold">三星专属强制</span> 标识的条文，这是申报三星级的不可逾越的红线。您输入的数据会自动保存至云端，刷新不丢失。
+            </p>
+        </section>
+
+        <!-- 核心数据仪表盘 (动态更新) -->
+        <section class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <!-- 动态总分环形图 -->
+            <div class="bg-white p-6 rounded-xl shadow-sm border border-slate-100 flex flex-col items-center relative">
+                <h3 class="text-md font-semibold text-slate-700 mb-4 w-full text-center">实时计算总得分</h3>
+                <div class="chart-container h-56 w-full max-w-xs">
+                    <canvas id="scoreChart"></canvas>
+                </div>
+                <div class="mt-4 text-center absolute top-[110px]">
+                    <p class="text-3xl font-black text-slate-800" id="displayTotalScore">0.00</p>
+                    <p class="text-xs text-slate-500 mt-1">/ 100 分</p>
+                </div>
+                <p id="scoreStatusText" class="text-xs text-slate-500 mt-6 text-center">请在下方表格输入得分开始计算<br>(含40分基础分)</p>
+            </div>
+
+            <!-- 控制项与规则提示 -->
+            <div class="bg-white p-6 rounded-xl shadow-sm border border-slate-100 flex flex-col justify-between">
+                <h3 class="text-md font-semibold text-slate-700 mb-2">算分规则提示</h3>
+                <div class="flex items-center justify-between p-4 bg-brand-50 rounded-lg mb-4">
+                    <div>
+                        <p class="text-xs text-brand-700 mb-1">公式：</p>
+                        <p class="text-sm font-bold text-brand-900">(基础分 400 + 评分项累加) ÷ 10</p>
+                    </div>
+                </div>
+                <div class="space-y-3">
+                    <h4 class="text-sm font-semibold text-slate-700 border-l-4 border-rose-500 pl-2">绿建三星强制一票否决：</h4>
+                    <div class="flex justify-between items-center text-sm border-b border-slate-100 pb-2">
+                        <span class="text-slate-600">全部通用规范 (GB55016等)</span>
+                        <span class="text-amber-600 font-bold text-xs bg-amber-100 rounded px-2 py-1">全星级强制</span>
+                    </div>
+                    <div class="flex justify-between items-center text-sm border-b border-slate-100 pb-2">
+                        <span class="text-slate-600">全寿命期碳排放计算及降碳措施</span>
+                        <span class="text-rose-600 font-bold text-xs bg-rose-100 rounded px-2 py-1">三星级专属强制</span>
+                    </div>
+                    <p class="text-xs text-slate-500 pt-2">注意：下方表格中的“控制项”必须100%满足才能获得400分基础分并参与评级。</p>
+                </div>
+            </div>
+
+            <!-- 动态雷达图 -->
+            <div class="bg-white p-6 rounded-xl shadow-sm border border-slate-100">
+                <h3 class="text-md font-semibold text-slate-700 mb-2 text-center">各版块实际得分率跟踪</h3>
+                <div class="chart-container h-64 w-full">
+                    <canvas id="radarChart"></canvas>
+                </div>
+            </div>
+        </section>
+
+        <!-- 交互式明细得分表 (带输入框) -->
+        <section class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden" id="scoringTable">
+            <div class="bg-slate-50 border-b border-slate-200 px-6 py-4 flex flex-col sm:flex-row justify-between sm:items-end gap-4">
+                <div>
+                    <h3 class="text-lg font-bold text-slate-800">各专业板块评分明细 (可编辑)</h3>
+                    <p class="text-xs text-slate-500 mt-1">切换标签栏查阅子项，带有输入框的项目请直接在细项后输入得分。</p>
+                </div>
+                <div class="text-left sm:text-right bg-white px-4 py-2 rounded shadow-sm border border-slate-100">
+                    <p class="text-xs text-slate-500" id="currentCategoryTitle">当前板块已填总计</p>
+                    <p class="text-2xl font-bold text-brand-600" id="currentCategorySum">0 <span class="text-sm font-normal text-slate-400" id="currentCategoryMax">/ 100</span></p>
+                </div>
+            </div>
+            
+            <!-- 分类控制按钮 -->
+            <div class="px-6 py-4 flex flex-wrap gap-2 border-b border-slate-100 bg-white" id="categoryTabs">
+                <!-- 动态生成Tabs -->
+            </div>
+
+            <!-- 数据表 -->
+            <div class="overflow-x-auto">
+                <table class="w-full text-left text-sm">
+                    <thead class="bg-slate-50 text-slate-600 font-semibold border-b border-slate-200">
+                        <tr>
+                            <th class="px-4 py-3 w-16 text-center whitespace-nowrap">编号</th>
+                            <th class="px-4 py-3 min-w-[300px]">评价主内容及细项评分区域</th>
+                            <th class="px-4 py-3 w-20 text-center whitespace-nowrap">满分要求</th>
+                            <th class="px-4 py-3 w-28 text-center bg-brand-50 border-b-2 border-brand-500 text-brand-800 whitespace-nowrap">状况/得分</th>
+                            <th class="px-4 py-3 min-w-[150px]">落实建议与备注</th>
+                        </tr>
+                    </thead>
+                    <tbody id="detailsTableBody" class="divide-y divide-slate-100 bg-white">
+                        <!-- JS 动态注入表格行 -->
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+    </main>
+
+    <footer class="bg-slate-800 text-slate-400 py-6 text-center text-xs mt-12">
+        <p>基于《绿色建筑评价标准》GB/T50378-2019 (2024修订版) 编制 | 通用自评工具</p>
+    </footer>
+
+    <!-- Firebase SDK & 逻辑脚本 -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- 数据结构 ---
+        const scoringData = {
+            '🔴 控制项 (强制/一票否决)': {
+                maxScore: '必达', isControl: true,
+                items: [
+                    { id: '3.2.8', content: '<span class="font-bold text-rose-700">明确全寿命期建筑碳排放强度，并明确降低碳排放强度的技术措施。</span><span class="bg-rose-100 text-rose-700 px-2 py-0.5 rounded text-xs font-bold ml-2 border border-rose-200 inline-block mt-1 sm:mt-0">三星专属强制</span>', subItems: [], max: '一票否决', score: '✔ 必须满足', note: '【最核心红线】没有《全寿命期碳排放测算报告》，直接失去三星级评审资格。' },
+                    { id: '3.2.4', content: '建筑内不应采用国家和地方禁止和限制使用的建筑材料及制品。', subItems: [], max: '控制项', score: '✔ 必须满足', note: '底线材料合规。' },
+                    { id: '4.1~8.1系列', content: '满足抗震、防跌落、室内空气质量、隔声、遮阳、水压、防污染等现行<span class="font-bold text-amber-700">全部强制性工程建设通用规范</span>。<span class="bg-amber-100 text-amber-700 px-2 py-0.5 rounded text-xs font-bold ml-2 border border-amber-200 inline-block mt-1 sm:mt-0">全星级强制</span>', subItems: [], max: '控制项', score: '✔ 必须满足', note: '包含GB55015、GB55016等十几本强条，未达标直接否决。' }
+                ]
+            },
+            '安全耐久': {
+                maxScore: 100,
+                items: [
+                    { id: '4.2.1', content: '采用基于性能的抗震设计并合理提高抗震性能。', subItems: [], max: 10, score: '', note: '结构超限报告证明。' },
+                    { id: '4.2.2', content: '采取保障人员安全的防护措施。', subItems: [{text:'1. 提高阳台、外窗、护栏等防护水平', max:5, score:''}, {text:'2. 出入口设防脱落并结合遮阳挡雨', max:5, score:''}, {text:'3. 利用场地景观形成防坠物缓冲区', max:5, score:''}], max: 15, score: '', note: '幕墙、栏杆图纸深化。' },
+                    { id: '4.2.3', content: '采用具有安全防护功能的产品或配件。', subItems: [{text:'1. 采用具有安全防护功能的玻璃', max:5, score:''}, {text:'2. 采用具备防夹功能的门窗', max:5, score:''}], max: 10, score: '', note: '自动门/闭门器落实。' },
+                    { id: '4.2.4', content: '室内外地面或路面设置防滑措施。', subItems: [{text:'1. 出入口、走廊、卫生间防滑达Bd/Bw级', max:3, score:''}, {text:'2. 活动场所防滑达到Ad/Aw级', max:4, score:''}, {text:'3. 坡道/楼梯防滑达Ad/Aw级或提高一级', max:3, score:''}], max: 10, score: '', note: '明确防滑材料参数。' },
+                    { id: '4.2.5', content: '人车分流，且步行和自行车交通系统有充足照明。', subItems: [], max: 8, score: '', note: '场地流线及照明图纸。' },
+                    { id: '4.2.6', content: '采取提升建筑适变性的措施。', subItems: [{text:'1. 通用开放/灵活可变使用空间设计', max:7, score:''}, {text:'2. 建筑结构与建筑设备管线分离', max:7, score:''}, {text:'3. 适应功能变化的设备布置方式', max:4, score:''}], max: 18, score: '', note: '活载取值、装修管线分离。' },
+                    { id: '4.2.7', content: '采取提升建筑部品部件耐久性的措施。', subItems: [{text:'1. 使用耐腐蚀、抗老化耐久管材管线', max:5, score:''}, {text:'2. 活动配件选长寿命产品且便于拆换升级', max:5, score:''}], max: 10, score: '', note: '成品门窗/活动配件。' },
+                    { id: '4.2.8', content: '【2024放宽】提高建筑结构材料的耐久性。', subItems: [{text:'1. 按100年进行耐久性设计', max:10, score:''}, {text:'2. 采用耐候结构钢 或 耐候型防腐涂料', max:10, score:''}], max: 10, score: '', note: '满足任一款即得满分。' },
+                    { id: '4.2.9', content: '合理采用耐久性好、易维护的装饰装修建材。', subItems: [{text:'1. 采用耐久性好的外饰面材料', max:3, score:''}, {text:'2. 采用耐久性好的防水和密封材料', max:3, score:''}, {text:'3. 采用耐久性好易维护室内装修材料', max:3, score:''}], max: 9, score: '', note: '水性涂料、高耐久密封胶。' }
+                ]
+            },
+            '健康舒适': {
+                maxScore: 100,
+                items: [
+                    { id: '5.2.1', content: '【2024修订】控制室内主要空气污染物的浓度。', subItems: [{text:'1. 氨、甲醛等低于限值10%(3分)，低20%(6分)', max:6, score:''}, {text:'2. 室内PM2.5及PM10年均浓度达标', max:6, score:''}], max: 12, score: '', note: '确保检测涵盖PM2.5。' },
+                    { id: '5.2.2', content: '选用的装饰装修材料满足有害物质限量要求。', subItems: [{text:'达到3类及以上(5分) / 达到5类及以上(8分)', max:8, score:''}], max: 8, score: '', note: '查验绿色产品证书。' },
+                    { id: '5.2.3', content: '【2024修订】直饮水、生活热水及供暖空调系统用水等水质达标。', subItems: [], max: 8, score: '', note: '暖通需补充空调水处理措施。' },
+                    { id: '5.2.4', content: '储水设施采取保障水质卫生的措施。', subItems: [{text:'1. 使用符合标准的成品水箱', max:4, score:''}, {text:'2. 采取保证储水不变质的措施', max:5, score:''}], max: 9, score: '', note: '水箱材质及清洗设计。' },
+                    { id: '5.2.5', content: '给排水管道、设备、设施设置明确清晰的永久性标识。', subItems: [], max: 8, score: '', note: '施工深化图注明。' },
+                    { id: '5.2.6', content: '【2024修订】采取措施优化主要功能房间的室内声环境。', subItems: [{text:'1. 外部噪声源传至室内比标准限值低3dB', max:4, score:''}, {text:'2. 内部设备噪声传至室内比标准限值低3dB', max:4, score:''}], max: 8, score: '', note: '需分别出具声学模拟报告。' },
+                    { id: '5.2.7', content: '【2024修订】主要功能房间的隔声性能良好。', subItems: [{text:'1. 空气声隔声达到GB50118高要求标准限值', max:5, score:''}, {text:'2. 撞击声隔声达到GB50118高要求标准限值', max:5, score:''}], max: 10, score: '', note: '隔墙/楼板隔声构造详审。' },
+                    { id: '5.2.8', content: '【2024修订】充分利用天然光。', subItems: [{text:'(公建) 内区采光系数达标比例≥60%', max:4, score:''}, {text:'(公建) 地下空间平均采光系数达标', max:4, score:''}, {text:'主要功能空间采光照度达标时间', max:4, score:''}], max: 12, score: '', note: '各子项新规均涨至4分。' },
+                    { id: '5.2.9', content: '具有良好的室内热湿环境。', subItems: [{text:'1. 自然/复合通风工况热舒适时间达标比例', max:8, score:''}, {text:'2. 供暖空调工况下达标面积比例≥60%', max:8, score:''}], max: 8, score: '', note: '按工况加权计算上限为8。' },
+                    { id: '5.2.10', content: '优化建筑空间和平面布局，改善自然通风效果。', subItems: [{text:'(公建) 过渡季典型工况换气次数≥2次/h面积比达70%', max:8, score:''}], max: 8, score: '', note: '起评5分，最高8分。' },
+                    { id: '5.2.11', content: '设置可调节遮阳设施，改善室内热舒适。', subItems: [{text:'遮阳设施面积占外窗透明部分比例25%~55%以上', max:9, score:''}], max: 9, score: '', note: '室内/室外遮阳卷帘。' }
+                ]
+            },
+            '生活便利': {
+                maxScore: 100,
+                items: [
+                    { id: '6.2.1', content: '场地到达公共交通站点的距离便捷度。', subItems: [{text:'1. 步行距离或轨道交通距离达标 (最高4分)', max:4, score:''}, {text:'2. 800m内设有不少于2条线路公交站', max:4, score:''}], max: 8, score: '', note: '交通区位分析。' },
+                    { id: '6.2.2', content: '【2024修订】建筑室内外公共区域满足全龄化设计要求。', subItems: [{text:'1. 场地及通路满足无障碍设计', max:3, score:''}, {text:'2. 阳角圆角并设有安全抓杆或扶手', max:5, score:''}, {text:'3. 设有可容纳担架的无障碍电梯', max:3, score:''}], max: 8, score: '', note: '最高限额8分。' },
+                    { id: '6.2.3', content: '提供公共服务。', subItems: [{text:'兼容社会功能/充电桩/开放空间等 (每项2分)', max:10, score:''}], max: 10, score: '', note: '商业业态及停车场开放。' },
+                    { id: '6.2.4', content: '城市绿地、广场及公共运动场地等开敞空间步行可达。', subItems: [{text:'1. 距城市公园/广场≤300m', max:3, score:''}, {text:'2. 距中型多功能运动场≤500m', max:2, score:''}], max: 5, score: '', note: '周边配套分析。' },
+                    { id: '6.2.5', content: '合理设置健身场地和空间。', subItems: [{text:'1. 室外场地面积占比达0.5%', max:3, score:''}, {text:'2. 专用健身慢行道', max:2, score:''}, {text:'3. 室内健身空间面积达标', max:3, score:''}, {text:'4. 设便捷采光楼梯', max:2, score:''}], max: 10, score: '', note: '景观与室内规划。' },
+                    { id: '6.2.6', content: '设置分项远传计量及能源管理平台。', subItems: [], max: 8, score: '', note: '智能化BA系统。' },
+                    { id: '6.2.7', content: '设置PM10、PM2.5、CO2空气质量监测及展示系统。', subItems: [], max: 5, score: '', note: '暖通与智能化配合。' },
+                    { id: '6.2.8', content: '设置用水远传计量及水质在线监测系统。', subItems: [{text:'1. 分类远传水表统计分析', max:3, score:''}, {text:'2. 管网漏损检测漏损率<5%', max:2, score:''}, {text:'3. 在线监测水质指标并供查询', max:2, score:''}], max: 7, score: '', note: '给排水智能化接入。' },
+                    { id: '6.2.9', content: '具有智能化服务系统。', subItems: [{text:'1. 具备至少3种类型服务功能', max:3, score:''}, {text:'2. 具远程监控功能', max:3, score:''}, {text:'3. 接入智慧城市/社区功能', max:3, score:''}], max: 9, score: '', note: '智慧物联平台。' },
+                    { id: '6.2.10', content: '【2024修订】制定节能节水等规程及运营管理考核体系。', subItems: [{text:'1. 设施有操作规程及应急预案', max:2, score:''}, {text:'2. 运营机构含节能节水考核激励', max:3, score:''}], max: 5, score: '', note: '运营考核文件。' },
+                    { id: '6.2.11', content: '建筑平均日用水量满足节水用水定额要求。', subItems: [], max: 5, score: '', note: '需核算用水报告。' },
+                    { id: '6.2.12', content: '【2024降分】定期对建筑运营效果进行评估与优化。', subItems: [{text:'1. 制定评估方案', max:3, score:''}, {text:'2. 定期检查调适设备', max:3, score:''}, {text:'3. 水质检测公示', max:2, score:''}], max: 10, score: '', note: '满分已降至10分。' },
+                    { id: '6.2.13', content: '【2024升分】建立绿色低碳教育宣传、手册及调查机制。', subItems: [{text:'1. 每年2次绿色低碳教育活动', max:3, score:''}, {text:'2. 提供绿色低碳生活展示平台/手册', max:3, score:''}, {text:'3. 每年1次满意度调查并改进', max:4, score:''}], max: 10, score: '', note: '强化低碳宣导权重。' }
+                ]
+            },
+            '资源节约': {
+                maxScore: 200,
+                items: [
+                    { id: '7.2.1', content: '节约集约利用土地。', subItems: [], max: 20, score: '', note: '核定容积率。' },
+                    { id: '7.2.2', content: '合理开发利用地下空间。', subItems: [], max: 12, score: '', note: '核定地下面积比。' },
+                    { id: '7.2.3', content: '采用机械式停车设施或地下停车。', subItems: [], max: 8, score: '', note: '地面停车占地限制。' },
+                    { id: '7.2.4', content: '【2024重度扣分预警】优化围护结构热工性能。', subItems: [{text:'1. 围护性能比GB55015提高5%~10%', max:10, score:''}, {text:'2. 空调负荷比GB55015降低3%~15%', max:10, score:''}], max: 10, score: '', note: '满分降至10分且基准变严。' },
+                    { id: '7.2.5', content: '【2024标准变严】冷热源机组能效优于通用规范。', subItems: [{text:'机组能效比GB55015提升8%~16% (最高10分)', max:10, score:''}], max: 10, score: '', note: '需厂家重核设备参数。' },
+                    { id: '7.2.6', content: '采取措施降低供暖空调输配系统能耗。', subItems: [{text:'1. 通风空调系统风机耗功率低20%', max:2, score:''}, {text:'2. 循环水泵耗电输比低20%', max:3, score:''}], max: 5, score: '', note: '水泵风机参数选型。' },
+                    { id: '7.2.7', content: '【2024修订】采用节能型电气设备及节能控制。', subItems: [{text:'1. 照明功率密度达标', max:5, score:''}, {text:'2. 随天然光自动调节', max:2, score:''}, {text:'3. 电力变压器满足能效2级要求', max:3, score:''}], max: 10, score: '', note: '重点复核变压器能效。' },
+                    { id: '7.2.8', content: '【2024修订】采取措施降低建筑能耗。', subItems: [{text:'设计能耗相比GB55015降低5%/10%/15%', max:10, score:''}], max: 10, score: '', note: '动态能耗模拟。' },
+                    { id: '7.2.9', content: '【2024升分】结合气候自然条件合理利用可再生能源。', subItems: [{text:'可再生能源提供热水/空调/电量比例', max:15, score:''}], max: 15, score: '', note: '抢分项，满分增至15分。' },
+                    { id: '7.2.10', content: '使用较高用水效率等级的卫生器具。', subItems: [{text:'全部达2级(8分) / 50%达1级(12分) / 全部1级(15分)', max:15, score:''}], max: 15, score: '', note: '给排水洁具选型。' },
+                    { id: '7.2.11', content: '【2024放宽】绿化灌溉及空调冷却系统采用节水技术。', subItems: [{text:'1. 节水灌溉+感应 (最高6分)', max:6, score:''}, {text:'2. 冷却水防溢出(3分) 或 无蒸发耗水(6分)', max:6, score:''}], max: 12, score: '', note: '绿化无需永久灌溉即可得6分。' },
+                    { id: '7.2.12', content: '结合雨水综合利用设施营造景观水体。', subItems: [{text:'1. 生态设施削减径流污染', max:4, score:''}, {text:'2. 保障室外景观水体水质', max:4, score:''}], max: 8, score: '', note: '水体系统配套。' },
+                    { id: '7.2.13', content: '使用非传统水源。', subItems: [{text:'冲厕或冷却水补水非传统水源占比', max:15, score:''}], max: 15, score: '', note: '回用水统筹。' },
+                    { id: '7.2.14', content: '实施土建与装修工程一体化设计及施工。', subItems: [], max: 8, score: '', note: '全装修方案。' },
+                    { id: '7.2.15', content: '【2024文字修订】合理选用建筑结构材料与构件。', subItems: [{text:'1. 高强钢筋/高耐久混凝土应用比例达标', max:10, score:''}, {text:'2. Q355及以上高强钢材/非现场焊接比例达标', max:10, score:''}], max: 10, score: '', note: '限高10分(混合结构取均值)。' },
+                    { id: '7.2.16', content: '建筑装修选用工业化内装部品。', subItems: [{text:'按同类部品用量比例及种类计分', max:8, score:''}], max: 8, score: '', note: '成品隔断、架空地板等。' },
+                    { id: '7.2.17', content: '选用可再循环材料、可再利用材料及利废建材。', subItems: [{text:'1. 可再循环材料和可再利用材料用量比例', max:6, score:''}, {text:'2. 利废建材选用及其用量比例', max:6, score:''}], max: 12, score: '', note: '绿色建材选用。' },
+                    { id: '7.2.18', content: '【2024重度扣分预警】选用绿色建材比例要求提高。', subItems: [{text:'应用比例≥40%(4分); ≥50%(8分); ≥70%(12分)', max:12, score:''}], max: 12, score: '', note: '起评门槛大幅升至40%。' }
+                ]
+            },
+            '环境宜居': {
+                maxScore: 100,
+                items: [
+                    { id: '8.2.1', content: '充分保护或修复场地生态环境。', subItems: [{text:'原自然水域保护或表层土回收利用等', max:10, score:''}], max: 10, score: '', note: '生态补偿措施。' },
+                    { id: '8.2.2', content: '场地年径流总量控制 (海绵设计)。', subItems: [{text:'达标相应年径流总量控制率', max:10, score:''}], max: 10, score: '', note: '海绵专项报告。' },
+                    { id: '8.2.3', content: '利用场地空间设置绿化用地。', subItems: [{text:'(公建) 1. 绿地率达指标105%', max:10, score:''}, {text:'(公建) 2. 绿地向公众开放', max:6, score:''}], max: 16, score: '', note: '景观图纸核算。' },
+                    { id: '8.2.4', content: '结合景观布局合理布置室外吸烟区。', subItems: [{text:'1. 远离出入口/进风口且在下风向', max:5, score:''}, {text:'2. 与绿植结合并有标识及收集筒', max:4, score:''}], max: 9, score: '', note: '总平图规划。' },
+                    { id: '8.2.5', content: '【2024新增】利用场地设置绿色雨水基础设施。', subItems: [{text:'1. 下凹绿地/调蓄水体面积占比达40%~60%', max:5, score:''}, {text:'2. 80%屋面雨水进入地面生态设施', max:3, score:''}, {text:'3. 80%道路雨水进入地面生态设施', max:4, score:''}, {text:'4. 硬质铺装地面透水铺装比例达50%', max:3, score:''}], max: 15, score: '', note: '抢分项：新增透水砖加分。' },
+                    { id: '8.2.6', content: '【2024文字修订】场地内环境噪声等效声级限值达标。', subItems: [{text:'环境噪声优于或等于2类声环境功能区标准', max:10, score:''}], max: 10, score: '', note: '环评声学专题。' },
+                    { id: '8.2.7A', content: '【2024全新修订】建筑室外照明及室外显示屏避免光污染。', subItems: [{text:'1. 居住空间窗外表面垂直照度不超过限值', max:5, score:''}, {text:'2. 室外显示屏平均亮度不超过限值且禁设动态', max:5, score:''}], max: 10, score: '', note: 'LED大屏严格限制。' },
+                    { id: '8.2.8', content: '场地风环境有利于室外活动和自然通风。', subItems: [{text:'1. 冬季无强风且风压差稳定', max:5, score:''}, {text:'2. 夏季/过渡季无涡旋区且开启窗有良好风压', max:5, score:''}], max: 10, score: '', note: '风环境模拟。' },
+                    { id: '8.2.9', content: '采取措施降低热岛强度。', subItems: [{text:'1. 室外活动场地设有遮阴措施', max:3, score:''}, {text:'2. 机动车道遮阴或路面高反射', max:3, score:''}, {text:'3. 屋顶绿化/光伏/高反射面积合计达75%', max:4, score:''}], max: 10, score: '', note: '外环境配置。' }
+                ]
+            },
+            '提高与创新': {
+                maxScore: 100,
+                items: [
+                    { id: '9.2.1', content: '【2024修订】供暖空调能效相比通用规范进一步降低。', subItems: [{text:'相比GB55015能耗每降低10%得5/10分', max:30, score:''}], max: 30, score: '', note: '高难度加分项。' },
+                    { id: '9.2.2A', content: '【2024新增】因地制宜建设绿色建筑。', subItems: [{text:'传承文化/适应气候/利用旧建筑等', max:30, score:''}], max: 30, score: '', note: '综合设计加分。' },
+                    { id: '9.2.3A', content: '【2024新增】采用蓄冷蓄热蓄电等实现建筑电力交互。', subItems: [{text:'负荷调节比例达5%得5分，每增1%加1分', max:20, score:''}], max: 20, score: '', note: '冰蓄冷/储能项目利好。' },
+                    { id: '9.2.4A', content: '【2024新增】采取措施提升场地绿容率。', subItems: [{text:'场地绿容率计算值及实测值综合计分', max:5, score:''}], max: 5, score: '', note: '景观优化。' },
+                    { id: '9.2.5', content: '采用符合工业化建造要求的结构体系与建筑构件。', subItems: [{text:'钢结构、木结构或预制装配结构比例', max:10, score:''}], max: 10, score: '', note: '装配式。' },
+                    { id: '9.2.6', content: '在规划设计、施工建造和运行维护阶段应用BIM技术。', subItems: [{text:'各阶段应用得5分，三个阶段全应用', max:15, score:''}], max: 15, score: '', note: 'BIM模型。' },
+                    { id: '9.2.7A', content: '【2024新增】采取措施降低建筑全寿命期碳排放强度。', subItems: [{text:'降低10%得10分，每再降1%加1分', max:30, score:''}], max: 30, score: '', note: '【关联控制红线】顺带抢分项。' },
+                    { id: '9.2.8', content: '【2024修订】按照绿色施工的要求进行施工和管理。', subItems: [{text:'1. 用电量比定额节约10%以上', max:4, score:''}, {text:'2. 建筑垃圾回收利用率不低于50%', max:4, score:''}, {text:'3. 获绿色施工优良/示范工程', max:8, score:''}, {text:'4. 减少预拌混凝土或钢筋损耗', max:4, score:''}], max: 20, score: '', note: '要求施工方建立能耗台账。' },
+                    { id: '9.2.9', content: '【2024重大新增】采用质量潜在缺陷保险或绿色建筑性能保险。', subItems: [{text:'1. 承保土建结构防水分项', max:10, score:''}, {text:'2. 承保机电管线装修分项', max:10, score:''}, {text:'3. 具有绿色建筑性能保险', max:10, score:''}], max: 30, score: '', note: '推荐购买保险以补充节约项失分！' },
+                    { id: '9.2.10', content: '采取其他创新且有明显效益。', subItems: [{text:'每采取一项创新项得10分', max:40, score:''}], max: 40, score: '', note: '专家评审酌定。' }
+                ]
+            }
+        };
+
+        // --- 全局状态 ---
+        let currentCategory = '🔴 控制项 (强制/一票否决)';
+        let chartsInstance = { score: null, radar: null };
+        let currentUser = null;
+        let saveTimeout = null;
+
+        // --- DOM 引用 ---
+        const categoryTabsEl = document.getElementById('categoryTabs');
+        const tbody = document.getElementById('detailsTableBody');
+        const displayTotalScore = document.getElementById('displayTotalScore');
+        const scoreStatusText = document.getElementById('scoreStatusText');
+        const headerStatus = document.getElementById('headerStatus');
+        const currentCategorySum = document.getElementById('currentCategorySum');
+        const currentCategoryMax = document.getElementById('currentCategoryMax');
+        const currentCategoryTitle = document.getElementById('currentCategoryTitle');
+        const cloudStatus = document.getElementById('cloudStatus');
+        const mainContent = document.getElementById('mainContent');
+
+        // --- Firebase 初始化 ---
+        const firebaseConfigStr = typeof __firebase_config !== 'undefined' ? __firebase_config : '{}';
+        let app, auth, db, appId;
+        try {
+            const firebaseConfig = JSON.parse(firebaseConfigStr);
+            appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            app = initializeApp(firebaseConfig);
+            auth = getAuth(app);
+            db = getFirestore(app);
+        } catch(e) {
+            console.error("Firebase config parsing error:", e);
+        }
+
+        // --- 核心鉴权与云端数据拉取 ---
+        const initAuthAndData = async () => {
+            if (!auth) {
+                // 如果 Firebase 初始化失败，提供降级体验（不保存）
+                cloudStatus.innerHTML = '🚫 云端离线 (仅本地浏览)';
+                initUI();
+                return;
+            }
+
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                    await signInWithCustomToken(auth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(auth);
+                }
+            } catch (error) {
+                console.error("Auth Error:", error);
+                cloudStatus.innerHTML = '🚫 鉴权失败 (仅本地浏览)';
+                initUI();
+            }
+        };
+
+        if (auth) {
+            onAuthStateChanged(auth, async (user) => {
+                currentUser = user;
+                if (user) {
+                    await loadScoresFromCloud();
+                } else {
+                    initUI();
+                }
+            });
+            initAuthAndData();
+        } else {
+            // 没有配置 Firebase 环境时，直接初始化UI
+            initUI();
+        }
+
+        // --- 从 Firestore 拉取数据 ---
+        async function loadScoresFromCloud() {
+            try {
+                const docRef = doc(db, 'artifacts', appId, 'users', currentUser.uid, 'green_building_scores', 'my_assessment');
+                const docSnap = await getDoc(docRef);
+                
+                if (docSnap.exists()) {
+                    const data = docSnap.data().scores || {};
+                    // 将扁平化的云端数据回填至深层结构中
+                    Object.keys(data).forEach(key => {
+                        const [cat, idxStr, subIdxStr] = key.split('_');
+                        const idx = parseInt(idxStr);
+                        if (scoringData[cat] && scoringData[cat].items[idx]) {
+                            if (subIdxStr === 'main') {
+                                scoringData[cat].items[idx].score = data[key];
+                            } else {
+                                const sIdx = parseInt(subIdxStr);
+                                if (scoringData[cat].items[idx].subItems[sIdx]) {
+                                    scoringData[cat].items[idx].subItems[sIdx].score = data[key];
+                                }
+                            }
+                        }
+                    });
+                }
+                cloudStatus.innerHTML = '<span class="text-brand-600 font-bold">☁️ 云端已同步</span>';
+            } catch (e) {
+                console.error("Error loading data from cloud:", e);
+                cloudStatus.innerHTML = '⚠️ 云端读取失败';
+            }
+            initUI();
+        }
+
+        // --- 防抖保存至 Firestore ---
+        function saveScoresToCloud() {
+            if (!currentUser || !db) return;
+
+            clearTimeout(saveTimeout);
+            cloudStatus.innerHTML = '<span class="loader"></span> 正在保存...';
+
+            saveTimeout = setTimeout(async () => {
+                try {
+                    const flatScores = {};
+                    Object.keys(scoringData).forEach(cat => {
+                        if (scoringData[cat].isControl) return; // 跳过控制项
+                        scoringData[cat].items.forEach((item, idx) => {
+                            if (item.subItems && item.subItems.length > 0) {
+                                item.subItems.forEach((sub, sIdx) => {
+                                    if (sub.score !== '' && sub.score !== undefined) {
+                                        flatScores[`${cat}_${idx}_${sIdx}`] = sub.score;
+                                    }
+                                });
+                            } else {
+                                if (item.score !== '' && item.score !== undefined) {
+                                    flatScores[`${cat}_${idx}_main`] = item.score;
+                                }
+                            }
+                        });
+                    });
+
+                    const docRef = doc(db, 'artifacts', appId, 'users', currentUser.uid, 'green_building_scores', 'my_assessment');
+                    await setDoc(docRef, { scores: flatScores }, { merge: true });
+                    cloudStatus.innerHTML = '<span class="text-brand-600 font-bold">☁️ 已保存至云端</span>';
+                } catch (e) {
+                    console.error("Error saving data:", e);
+                    cloudStatus.innerHTML = '<span class="text-rose-500 font-bold">❌ 保存失败</span>';
+                }
+            }, 1200); // 1.2秒防抖，避免频繁写入
+        }
+
+        // --- 初始化 UI 骨架与事件 ---
+        function initUI() {
+            mainContent.style.opacity = '1';
+            mainContent.style.pointerEvents = 'auto';
+            
+            renderTabs();
+            initCharts();
+            // 在 JS 环境下为全局绑定切换函数
+            window.switchCategory = switchCategory;
+            switchCategory('🔴 控制项 (强制/一票否决)');
+            calculateTotals(); 
+        }
+
+        // --- 渲染分类标签 ---
+        function renderTabs() {
+            categoryTabsEl.innerHTML = '';
+            Object.keys(scoringData).forEach(cat => {
+                const isControl = scoringData[cat].isControl;
+                const btn = document.createElement('button');
+                
+                if (currentCategory === cat) {
+                    btn.className = `tab-btn px-4 py-2 text-sm rounded-md border shadow-sm transition-colors ${isControl ? 'tab-alert active' : 'active'}`;
+                } else {
+                    btn.className = `tab-btn px-4 py-2 text-sm rounded-md border border-slate-300 transition-colors ${isControl ? 'text-rose-600 hover:bg-rose-50 hover:border-rose-300 font-semibold' : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'}`;
+                }
+                
+                btn.innerText = cat;
+                btn.onclick = () => window.switchCategory(cat);
+                categoryTabsEl.appendChild(btn);
+            });
+        }
+
+        // --- 切换分类 ---
+        function switchCategory(cat) {
+            currentCategory = cat;
+            renderTabs();
+            renderTable();
+            updateCategoryHeader();
+        }
+
+        // --- 渲染表格 ---
+        function renderTable() {
+            tbody.innerHTML = '';
+            const data = scoringData[currentCategory].items;
+            const isControlSection = scoringData[currentCategory].isControl;
+            
+            data.forEach((row, index) => {
+                const hasSubItems = row.subItems && row.subItems.length > 0;
+                
+                let contentHtml = `<p class="text-slate-800 font-medium leading-relaxed">${row.content}</p>`;
+                if (hasSubItems) {
+                    contentHtml += `
+                        <ul class="mt-3 space-y-2 border-t border-slate-100 pt-3">
+                            ${row.subItems.map((sub, sIdx) => `
+                                <li class="flex items-center justify-between text-xs bg-slate-50 p-2.5 rounded-md border border-slate-100 shadow-sm">
+                                    <span class="text-slate-600 flex-1 pr-3 leading-snug">${sub.text} <span class="text-slate-400 block mt-0.5">(限高 ${sub.max} 分)</span></span>
+                                    <input type="number" min="0" max="${sub.max}" value="${sub.score !== undefined ? sub.score : ''}" 
+                                        data-index="${index}" data-sub="${sIdx}"
+                                        placeholder="得分"
+                                        class="sub-score-input"
+                                        title="请输入此细项的评估得分">
+                                </li>
+                            `).join('')}
+                        </ul>
+                    `;
+                }
+
+                let scoreCellHtml = '';
+                if (isControlSection) {
+                    scoreCellHtml = `<span class="bg-brand-100 text-brand-700 px-3 py-1 rounded-full text-xs font-bold whitespace-nowrap shadow-sm border border-brand-200">✔ 必须满足</span>`;
+                } else {
+                    if (hasSubItems) {
+                        scoreCellHtml = `<div class="text-lg font-bold ${row.score !== '' && row.score !== undefined ? 'text-brand-600' : 'text-slate-300'}" id="main-score-${index}">${row.score !== '' && row.score !== undefined ? Number(row.score).toFixed(1) : '-'}</div>`;
+                    } else {
+                        scoreCellHtml = `
+                            <input type="number" min="0" max="${row.max}" value="${row.score !== undefined ? row.score : ''}" 
+                                data-index="${index}"
+                                placeholder="填入得分"
+                                class="score-input w-24 px-2 py-1.5 border border-brand-200 rounded text-center text-brand-900 font-bold focus:outline-none focus:ring-2 focus:ring-brand-500 bg-white shadow-sm transition-all"
+                                title="该项无细项分解，请直接输入汇总得分">
+                        `;
+                    }
+                }
+
+                const tr = document.createElement('tr');
+                tr.className = `transition-colors group ${isControlSection ? 'hover:bg-rose-50/30' : 'hover:bg-slate-50/50'}`;
+                tr.innerHTML = `
+                    <td class="px-4 py-4 font-medium text-slate-700 text-center align-top pt-5">${row.id}</td>
+                    <td class="px-4 py-4 align-top">${contentHtml}</td>
+                    <td class="px-4 py-4 text-center text-slate-500 font-mono align-top pt-5">${row.max}</td>
+                    <td class="px-4 py-4 text-center align-top pt-4">${scoreCellHtml}</td>
+                    <td class="px-4 py-4 text-xs text-slate-500 align-top pt-5 leading-relaxed">${row.note}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            if (!isControlSection) {
+                document.querySelectorAll('input[type="number"]').forEach(input => {
+                    input.addEventListener('input', (e) => {
+                        handleScoreInput(e.target.dataset.index, e.target.dataset.sub, e.target.value);
+                    });
+                });
+            }
+        }
+
+        // --- 处理分数输入与自动推导 ---
+        function handleScoreInput(index, subIndex, value) {
+            if(scoringData[currentCategory].isControl) return; 
+
+            let numVal = parseFloat(value);
+            const isSubItem = subIndex !== undefined && subIndex !== "undefined";
+            const targetItem = scoringData[currentCategory].items[index];
+            const maxVal = isSubItem ? targetItem.subItems[subIndex].max : targetItem.max;
+            
+            let finalVal = '';
+            if (!isNaN(numVal) && value.trim() !== '') {
+                finalVal = Math.min(Math.max(0, numVal), maxVal); 
+            }
+
+            if (isSubItem) {
+                targetItem.subItems[subIndex].score = finalVal;
+                
+                let totalSubScore = 0;
+                let hasFilledSub = false;
+                targetItem.subItems.forEach(sub => {
+                    if (sub.score !== '' && sub.score !== undefined) {
+                        totalSubScore += Number(sub.score);
+                        hasFilledSub = true;
+                    }
+                });
+                
+                if (hasFilledSub) {
+                    targetItem.score = Math.min(totalSubScore, targetItem.max);
+                } else {
+                    targetItem.score = ''; 
+                }
+
+                const mainScoreDiv = document.getElementById(`main-score-${index}`);
+                if (mainScoreDiv) {
+                    mainScoreDiv.innerText = targetItem.score !== '' && targetItem.score !== undefined ? Number(targetItem.score).toFixed(1) : '-';
+                    mainScoreDiv.className = `text-lg font-bold ${targetItem.score !== '' && targetItem.score !== undefined ? 'text-brand-600' : 'text-slate-300'}`;
+                }
+                
+            } else {
+                targetItem.score = finalVal;
+            }
+            
+            calculateTotals();
+            
+            // ★ 触发云端保存
+            saveScoresToCloud();
+        }
+
+        // --- 核心计算引擎 ---
+        function calculateTotals() {
+            let catSums = {};
+            let totalInteractiveScore = 0;
+
+            Object.keys(scoringData).forEach(cat => {
+                if(scoringData[cat].isControl) return; 
+
+                let catSum = 0;
+                scoringData[cat].items.forEach(item => {
+                    if (item.score !== '' && item.score !== undefined) {
+                        catSum += parseFloat(item.score);
+                    }
+                });
+                
+                if(cat !== '提高与创新' && catSum > scoringData[cat].maxScore) {
+                    catSum = scoringData[cat].maxScore;
+                } else if (cat === '提高与创新' && catSum > 100) {
+                    catSum = 100;
+                }
+                
+                catSums[cat] = catSum;
+                totalInteractiveScore += catSum;
+            });
+
+            const finalScore = (400 + totalInteractiveScore) / 10;
+            
+            updateCategoryHeader(catSums[currentCategory]);
+            updateDashboard(finalScore, catSums);
+        }
+
+        // --- 更新表格顶部统计 ---
+        function updateCategoryHeader(sum) {
+            if (scoringData[currentCategory].isControl) {
+                currentCategoryTitle.innerText = "状态要求";
+                currentCategorySum.innerText = "必须满足";
+                currentCategorySum.className = "text-xl font-bold text-rose-600";
+                currentCategoryMax.innerText = "";
+                return;
+            }
+
+            currentCategoryTitle.innerText = "当前板块已填总计";
+            currentCategorySum.className = "text-2xl font-bold text-brand-600";
+
+            if (typeof sum === 'undefined') {
+                sum = 0;
+                scoringData[currentCategory].items.forEach(item => {
+                    if (item.score !== '' && item.score !== undefined) {
+                        sum += parseFloat(item.score);
+                    }
+                });
+                if (currentCategory !== '提高与创新' && sum > scoringData[currentCategory].maxScore) {
+                    sum = scoringData[currentCategory].maxScore;
+                } else if (currentCategory === '提高与创新' && sum > 100) {
+                    sum = 100;
+                }
+            }
+            
+            currentCategorySum.innerText = sum.toFixed(1);
+            currentCategoryMax.innerText = `/ ${scoringData[currentCategory].maxScore}`;
+        }
+
+        // --- 初始化图表 ---
+        function initCharts() {
+            // 销毁已有的 scoreChart 实例
+            if (chartsInstance.score) {
+                chartsInstance.score.destroy();
+            }
+            const scoreCtx = document.getElementById('scoreChart').getContext('2d');
+            chartsInstance.score = new Chart(scoreCtx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['当前计算总分', '缺口/未得分'],
+                    datasets: [{
+                        data: [0, 100], 
+                        backgroundColor: ['#10b981', '#f1f5f9'],
+                        borderWidth: 0, hoverOffset: 2
+                    }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false, cutout: '75%',
+                    plugins: { legend: { display: false }, tooltip: { enabled: false } },
+                    animation: { animateScale: true }
+                }
+            });
+
+            // 销毁已有的 radarChart 实例
+            if (chartsInstance.radar) {
+                chartsInstance.radar.destroy();
+            }
+            const radarCtx = document.getElementById('radarChart').getContext('2d');
+            chartsInstance.radar = new Chart(radarCtx, {
+                type: 'radar',
+                data: {
+                    labels: ['安全耐久', '健康舒适', '生活便利', '资源节约', '环境宜居', '提高与创新'],
+                    datasets: [{
+                        label: '得分进度 (%)',
+                        data: [0,0,0,0,0,0],
+                        backgroundColor: 'rgba(16, 185, 129, 0.2)', borderColor: '#10b981',
+                        pointBackgroundColor: '#059669', pointBorderColor: '#fff',
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true, maintainAspectRatio: false,
+                    scales: {
+                        r: {
+                            angleLines: { color: 'rgba(0, 0, 0, 0.05)' }, grid: { color: 'rgba(0, 0, 0, 0.05)' },
+                            pointLabels: { font: { family: "'Segoe UI', sans-serif", size: 11 }, color: '#475569' },
+                            ticks: { max: 100, min: 0, display: false }
+                        }
+                    },
+                    plugins: { legend: { display: false }, tooltip: {
+                        callbacks: { label: (context) => `当前进度: ${context.parsed.r.toFixed(1)}%` }
+                    }}
+                }
+            });
+        }
+
+        // --- 更新仪表盘UI ---
+        function updateDashboard(finalScore, catSums) {
+            displayTotalScore.innerText = finalScore.toFixed(2);
+            
+            if(finalScore === 40.00) {
+                scoreStatusText.innerHTML = "请在下方表格输入得分开始计算<br>(含40分基础分)";
+                headerStatus.className = "px-3 py-1 rounded-full bg-slate-100 text-slate-600 text-sm font-medium";
+                headerStatus.innerText = "状态: 待填报评估";
+                chartsInstance.score.data.datasets[0].backgroundColor[0] = '#94a3b8'; 
+            } else if (finalScore >= 85) {
+                scoreStatusText.innerHTML = '<span class="text-brand-600 font-bold text-sm">&#10004; 已达到三星级门槛</span>';
+                headerStatus.className = "px-3 py-1 rounded-full bg-brand-100 text-brand-700 text-sm font-medium shadow-sm border border-brand-200";
+                headerStatus.innerText = "状态: 三星级达标";
+                chartsInstance.score.data.datasets[0].backgroundColor[0] = '#10b981'; 
+            } else {
+                const diff = (85 - finalScore).toFixed(2);
+                scoreStatusText.innerHTML = `<span class="text-amber-600 font-bold">&#9888; 距三星级及格线还差 ${diff} 分</span>`;
+                headerStatus.className = "px-3 py-1 rounded-full bg-amber-50 text-amber-700 text-sm font-medium border border-amber-200";
+                headerStatus.innerText = "状态: 未达三星级";
+                chartsInstance.score.data.datasets[0].backgroundColor[0] = '#f59e0b'; 
+            }
+
+            chartsInstance.score.data.datasets[0].data = [finalScore, 100 - finalScore < 0 ? 0 : 100 - finalScore];
+            chartsInstance.score.update();
+
+            const radarData = [
+                (catSums['安全耐久'] / 100) * 100 || 0,
+                (catSums['健康舒适'] / 100) * 100 || 0,
+                (catSums['生活便利'] / 100) * 100 || 0,
+                (catSums['资源节约'] / 200) * 100 || 0,
+                (catSums['环境宜居'] / 100) * 100 || 0,
+                (catSums['提高与创新'] / 100) * 100 || 0
+            ];
+            chartsInstance.radar.data.datasets[0].data = radarData;
+            chartsInstance.radar.update();
+        }
+
+    </script>
+</body>
+</html>
